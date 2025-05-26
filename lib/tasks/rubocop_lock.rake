@@ -33,6 +33,10 @@
 # system. This allows tracking changes to the effective RuboCop configuration
 # over time.
 #
+# Implementation Note: These tasks now interact directly with RuboCop's Ruby API
+# to obtain configuration information, ensuring greater robustness and
+# efficiency compared to shelling out to the `rubocop` executable.
+#
 # Optional: Enforcing Lockfile Freshness:
 # For projects desiring a stricter workflow, this Rake setup will also provide
 # a task to verify that `rubocop.lock.yml` is up-to-date before running
@@ -59,9 +63,9 @@
 #
 # -----------------------------------------------------------------------------
 
-require 'open3'
-require 'yaml'
-require 'fileutils' # For potential future use, not strictly needed now but good for file ops
+require 'yaml' # Still needed for YAML.dump in generate_lockfile and YAML.safe_load in check_lockfile
+require 'fileutils' # For potential future use
+require 'rubocop' # Required for using the RuboCop API
 
 # Helper method to recursively normalize paths within a configuration structure.
 # Replaces occurrences of the project_root_path with "<PROJECT_ROOT>".
@@ -99,31 +103,48 @@ def _deep_sort_hash(object)
   end
 end
 
-# Helper method to get the current, normalized, and sorted RuboCop configuration.
+# Helper method to get the current, normalized, and sorted RuboCop configuration
+# using the RuboCop API.
 # Returns [normalized_and_sorted_config, error_message]. error_message is nil on success.
-# This method does not print to stdout/stderr directly, allowing callers to decide.
 def _get_current_sorted_rubocop_config
-  stdout, stderr, status = Open3.capture3('bundle exec rubocop --show-cops')
-
-  unless status.success?
-    return [nil, "Failed to execute 'bundle exec rubocop --show-cops':\n#{stderr}"]
-  end
+  current_config_data = nil
+  error_message = nil
 
   begin
-    parsed_config = YAML.safe_load(stdout, aliases: true)
-  rescue Psych::SyntaxError => e
-    return [nil, "Failed to parse YAML output from rubocop --show-cops:\n#{e.message}\nRaw output was:\n#{stdout}"]
+    config_store = RuboCop::ConfigStore.new
+    project_config = config_store.for_pwd 
+
+    raw_config_hash = {}
+
+    all_cops_settings = project_config.for_all_cops
+    raw_config_hash['AllCops'] = all_cops_settings.dup if all_cops_settings && !all_cops_settings.empty?
+
+    RuboCop::Cop::Registry.all.each do |cop_klass|
+      cop_name_str = cop_klass.cop_name 
+      cop_specific_config = project_config.for_cop(cop_klass)
+      raw_config_hash[cop_name_str] = cop_specific_config.dup if cop_specific_config && !cop_specific_config.empty?
+    end
+
+    current_config_data = raw_config_hash
+    error_message = nil # Success
+  rescue StandardError => e
+    current_config_data = nil
+    error_message = "Error fetching RuboCop config via API: #{e.class.name} - #{e.message}\nBacktrace:\n#{e.backtrace.join("\n")}"
   end
 
-  unless parsed_config.is_a?(Hash)
-    return [nil, "Parsed configuration is not a Hash. Actual type: #{parsed_config.class}\nRaw output was:\n#{stdout}"]
+  if error_message # If API fetching failed, return immediately
+    return [nil, error_message]
+  end
+
+  unless current_config_data.is_a?(Hash) # Should be a hash if API call was successful
+    return [nil, "Fetched configuration via API is not a Hash. Actual type: #{current_config_data.class}"]
   end
 
   current_project_root = File.expand_path(Dir.pwd)
-  normalized_config = _normalize_paths_in_config(parsed_config, current_project_root)
+  normalized_config = _normalize_paths_in_config(current_config_data, current_project_root)
   
   normalized_and_sorted_config = _deep_sort_hash(normalized_config)
-  [normalized_and_sorted_config, nil]
+  [normalized_and_sorted_config, nil] # error_message is nil here because API call and processing were successful
 end
 
 namespace :rubocop do
@@ -131,13 +152,12 @@ namespace :rubocop do
   task :generate_lockfile do
     puts "Generating RuboCop lockfile..."
     
-    puts "Fetching current RuboCop configuration..."
-    # Variable name updated to reflect it's now normalized and sorted
+    puts "Fetching current RuboCop configuration using API..."
     processed_config, error_msg = _get_current_sorted_rubocop_config
 
     unless processed_config
-      warn "ERROR: #{error_msg}" # Using warn for errors, which goes to STDERR
-      exit 1 # Exit with a non-zero status to indicate failure
+      warn "ERROR: #{error_msg}" 
+      exit 1 
     end
     
     puts "Current configuration fetched, normalized, and sorted successfully."
@@ -171,7 +191,6 @@ namespace :rubocop do
   task :check_lockfile do
     puts "Checking RuboCop lockfile status..."
 
-    # Case-insensitive check for the environment variable
     unless ENV['RUBOCOP_VALIDATE_LOCKFILE']&.downcase == 'true'
       puts "RUBOCOP_VALIDATE_LOCKFILE not set to 'true', skipping check."
       exit 0
@@ -186,21 +205,18 @@ namespace :rubocop do
       exit 1
     end
 
-    puts "Fetching current RuboCop configuration for comparison..."
-    # Variable name updated to reflect it's now normalized and sorted
+    puts "Fetching current RuboCop configuration using API for comparison..."
     current_processed_config, error_msg = _get_current_sorted_rubocop_config
 
     unless current_processed_config
       warn "ERROR fetching current configuration: #{error_msg}"
-      exit 1 # Exit with a non-zero status to indicate failure
+      exit 1 
     end
     puts "Current configuration fetched, normalized, and sorted successfully."
 
     puts "Reading existing '#{lockfile_path}'..."
     begin
       lockfile_content = File.read(lockfile_path)
-      # YAML.safe_load will ignore comments (like the header) by default.
-      # Using aliases: true as the stored config might also use them.
       lockfile_config = YAML.safe_load(lockfile_content, aliases: true)
     rescue Psych::SyntaxError => e
       warn "ERROR: Failed to parse YAML from '#{lockfile_path}': #{e.message}"
@@ -216,7 +232,6 @@ namespace :rubocop do
     end
 
     puts "Comparing current configuration with '#{lockfile_path}'..."
-    # The lockfile_config from the file is already expected to be normalized and sorted.
     if current_processed_config == lockfile_config
       puts "'#{lockfile_path}' is up to date."
       exit 0
